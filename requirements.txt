@@ -1,0 +1,10 @@
+jax
+flax
+tyro
+optax
+numpy
+tiktoken
+wandb
+datasets
+torch
+tensorboard
