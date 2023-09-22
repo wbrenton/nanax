@@ -3,7 +3,7 @@
 ### Minimal implementations in JAX (nano + JAX)
 
 
-Minimal implementations of various deep learning architectures and training procedures in JAX (Flax). Heavily inspired by [CleanRL](https://github.com/vwxyzjn/cleanrl), with simple and clean implementations for buiding research on top of.
+Minimal implementations of various deep learning architectures and training procedures in JAX. Heavily inspired by [CleanRL](https://github.com/vwxyzjn/cleanrl), offering simple and clean implementations with the goal of rapid prototyping for further research.
 
 ### Roadmap
 - [X] Generative Pre-trained Transformer ([GPT2](https://d4mucfpksywv.cloudfront.net/better-language-models/language-models.pdf))
