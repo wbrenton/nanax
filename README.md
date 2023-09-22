@@ -1,6 +1,6 @@
 # Nanax 
 > **Warning**: this project is a work in progress
-### Minimal implementations in JAX (nano + JAX)
+### Nano + JAX
 
 
 Minimal implementations of various deep learning architectures and training procedures in JAX. Heavily inspired by [CleanRL](https://github.com/vwxyzjn/cleanrl), offering simple and clean implementations with the goal of rapid prototyping for further research.
