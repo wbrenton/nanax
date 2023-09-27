@@ -15,6 +15,7 @@ import orbax
 import tyro
 from datasets import load_dataset
 from flax import jax_utils, traverse_util
+from flax import struct
 from flax.core import freeze
 from flax.training import common_utils, orbax_utils
 from flax.training.train_state import TrainState
@@ -28,8 +29,8 @@ from model import GPT
 class GPTHParams:
     block_size: int = 256
     vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6
+    n_layer: int = 6 // 3
+    n_head: int = 6 // 3
     n_embd: int = 384
     dropout: float = 0.2
     use_bias: bool = False
@@ -77,6 +78,8 @@ class Args:
     """number of update steps to decay for"""
     end_lr: float = 1e-4
     "the minimum learning rate"
+    gradient_accumulation_steps: int = 8
+    """The number of steps to accumulate before performing an update"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
     local_batch_size: tyro.conf.Suppress[int] = 64
@@ -87,10 +90,10 @@ class Args:
     """total number of optimization steps"""
     eval_frequency: int = 250
     """How often to evaluate during training"""
-    eval_iterations: int = 200
+    eval_iterations: int = 1 #200
     """Number of validation batches per evaluation"""
-    print_sample_output_freq: int = 10
-    """How often to print sample output"""
+    print_output_freq: int = 10
+    """How often to print"""
     save_path: str = "models/"
     """Where to save the model"""
 
@@ -104,6 +107,11 @@ class Args:
     global_learner_decices: tyro.conf.Suppress[int] = None  # real type is `List[str]`
     """the total devices (across all nodes and machines) that script will use"""
     gpt2_hparams: GPTHParams = field(default_factory=GPTHParams)
+
+@struct.dataclass
+class Batch:
+    input_tokens: jnp.array
+    target_tokens: jnp.array
 
 def load_hf_dataset(args):
 
@@ -168,37 +176,54 @@ def load_hf_dataset(args):
 def get_dataloader_iter(rng, dataset, args, train=True):
     """Get iteration of dataloader."""
     block_size = args.gpt2_hparams.block_size
-    shape = (args.total_update_steps if train else args.eval_iterations, args.batch_size)
+    shape = (
+        args.total_update_steps if train else args.eval_iterations,
+        args.batch_size * args.gradient_accumulation_steps if train else args.batch_size
+    )
     idxs = jax.random.randint(rng, shape=shape, minval=0, maxval=len(dataset)-block_size)
+    batch_shape = (args.gradient_accumulation_steps, args.batch_size, block_size) if train else (args.batch_size, block_size)
     for idx in idxs:
-        x = jnp.stack([dataset[i : i+block_size] for i in idx])
-        y = jnp.stack([dataset[i+1 : i+1+block_size] for i in idx])
-        yield x, y
+        x = jnp.stack([dataset[i : i+block_size] for i in idx]).reshape(batch_shape)
+        y = jnp.stack([dataset[i+1 : i+1+block_size] for i in idx]).reshape(batch_shape)
+        yield Batch(input_tokens=x, target_tokens=y)
 
 def train_step(state, batch, rng):
-    input_tokens, target_tokens = batch
     
-    def loss_fn(params):
-        logits = state.apply_fn(params, input_tokens, rngs={"dropout": rng})
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_tokens).mean()
-        accuracy = (logits.argmax(-1) == target_tokens).mean()
+    def loss_fn(params, mb, rng):
+        logits = state.apply_fn(params, mb.input_tokens, rngs={"dropout": rng})
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, mb.target_tokens).mean()
+        accuracy = (logits.argmax(-1) == mb.target_tokens).mean()
         return loss, accuracy
     
     value_and_grad = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, accuracy), grads = value_and_grad(state.params)
-    grads = jax.lax.pmean(grads, "batch")
+
+    def minibatch_step(cumulative_state, minibatch):
+        loss, accuracy, grads, rng = cumulative_state
+        step_key, rng = jax.random.split(rng)
+        (mini_loss, mini_accuracy), mini_grads = value_and_grad(state.params, minibatch, step_key)
+        # mini_grads = jax.lax.pmean(mini_grads, "batch")
+        loss, accuracy, grads = jax.tree_map(jnp.add, (loss, accuracy, grads), (mini_loss, mini_accuracy, mini_grads))
+        return (loss, accuracy, grads, rng), None
+    
+    # accumulate gradients
+    init_state = (0., 0., jax.tree_map(jnp.zeros_like, state.params), rng)
+    (loss, accuracy, grads, rng), _ = jax.lax.scan(
+        f=minibatch_step,
+        init=init_state,
+        xs=batch)
+    # sum -> mean
+    loss, accuracy, grads = jax.tree_map(lambda x: x/args.gradient_accumulation_steps, (loss, accuracy, grads))
+    # mean across learners
+    loss, accuracy, grads = jax.tree_map(lambda x: jax.lax.pmean(x, axis_name='batch'), (loss, accuracy, grads))
     state = state.apply_gradients(grads=grads)
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    accuracy = jax.lax.pmean(accuracy, axis_name="batch")
     return state, {"loss": loss, "accuracy": accuracy}
 
 def val_step(state, batch):
-    input_tokens, target_tokens = batch
     
     def loss_fn(params):
-        logits = state.apply_fn(params, input_tokens, train=False)
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_tokens).mean()
-        accuracy = (logits.argmax(-1) == target_tokens).mean()
+        logits = state.apply_fn(params, batch.input_tokens, train=False)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, batch.target_tokens).mean()
+        accuracy = (logits.argmax(-1) == batch.target_tokens).mean()
         return loss, accuracy
 
     loss, accuracy = loss_fn(state.params)
@@ -312,6 +337,7 @@ def train(args: Args):
                 val_metrics[key] = value
                 writer.add_scalar(f"validation/{key}", value, global_step)
             print(f"global_step: {global_step}  test/accuracy: {val_metrics['accuracy']:.3f}")
+        print(f"global_step: {global_step}  train/accuracy: {train_metrics['accuracy'].item():.3f}")
 
     state = jax_utils.unreplicate(state)
     

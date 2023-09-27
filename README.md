@@ -2,6 +2,9 @@
 > **Warning**: this project is a work in progress
 ### Nano + JAX
 
+```
+The main idea behind nanax is to create a CleanRL type of library for deep learning architectures and training pro
+```
 
 Minimal implementations of various deep learning architectures and training procedures in JAX. Heavily inspired by [CleanRL](https://github.com/vwxyzjn/cleanrl), offering simple and clean implementations with the goal of rapid prototyping for further research.
 
