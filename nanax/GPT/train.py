@@ -1,6 +1,7 @@
 import functools
 import os
 import time
+from tqdm import tqdm
 import tiktoken
 from functools import partial
 from types import SimpleNamespace
@@ -29,8 +30,8 @@ from model import GPT
 class GPTHParams:
     block_size: int = 256
     vocab_size: int = 65
-    n_layer: int = 6 // 3
-    n_head: int = 6 // 3
+    n_layer: int = 6
+    n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.2
     use_bias: bool = False
@@ -45,9 +46,9 @@ class Args:
     """seed of the experiment"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanrl"
+    wandb_project_name: str = "nanax"
     """the wandb's project name"""
-    wandb_entity: Optional[str] = "nanax"
+    wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
     cuda: bool = True
     """Whether to use cuda if available."""
@@ -58,7 +59,7 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
-    dataset_name: str = "tiny_shakespeare" # "openwebtext" 
+    dataset_name: str = "openwebtext" # "tiny_shakespeare" 
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     lr: float = 1e-3
     """the maximum learning rate"""
@@ -78,7 +79,7 @@ class Args:
     """number of update steps to decay for"""
     end_lr: float = 1e-4
     "the minimum learning rate"
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 1
     """The number of steps to accumulate before performing an update"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
@@ -86,6 +87,8 @@ class Args:
     """the per rank batch size"""
     batch_size: tyro.conf.Suppress[int] = None
     """the batch size across all ranks"""
+    effective_batch_size: tyro.conf.Suppress[int] = None
+    """the effective batch size by way of gradient accumulation"""
     total_update_steps: int = 5000
     """total number of optimization steps"""
     eval_frequency: int = 250
@@ -114,25 +117,24 @@ class Batch:
     target_tokens: jnp.array
 
 def load_hf_dataset(args):
+    """Loads a HuggingFace dataset and saves it to disk using np.memmap"""
 
     def process_shakespear(data, split: str):
-        # nanoGPT processing
-        text = data[split]['text'][0]
-        chars = sorted(list(set(text)))
+        chars = sorted(list(set(data[split]['text'][0])))
         vocab_size = len(chars)
         stoi = { ch:i for i,ch in enumerate(chars) }
         itos = { i:ch for i,ch in enumerate(chars) }
         encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list of integers
         decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
-        train_data = np.array(encode(text), dtype=np.uint16)
+        train_data = np.array(encode(data[split]['text'][0]), dtype=np.uint16)
         val_data = np.array(encode(data[split]['text'][0]), dtype=np.uint16)
         return train_data, val_data, vocab_size, encode, decode
 
-    def process_webtext(data):
-        # copied from https://github.com/cgarciae/nanoGPT-jax/blob/24fd60f987a946915e43c0000195bd73ddc34271/data/openwebtext/prepare.py
+    def process_webtext(dataset, dataset_dir):
         split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)
         split_dataset['validation'] = split_dataset.pop('test')
 
+        # https://github.com/huggingface/datasets/issues/5536#issuecomment-1712221963
         class TikTokenFactory:
             def __init__(self):
                 self._enc = None
@@ -161,17 +163,47 @@ def load_hf_dataset(args):
             num_proc=8,
         )
 
-        print('dummy')
-        print('dummy')
+        # concatenate all the ids in each dataset into one large file we can use for training
+        for split, dset in tokenized.items():
+            arr_len = np.sum(dset['len'])
+            filename = f'{split}.bin'
+            dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
+            arr = np.memmap(os.path.join(dataset_dir, filename), dtype=dtype, mode='w+', shape=(arr_len,))
 
-        return train_data, val_data, vocab_size, encode, decode
+            print(f"writing {filename}...")
+            idx = 0
+            for example in tqdm(dset):
+                arr[idx : idx + example['len']] = example['ids']
+                idx += example['len']
+            arr.flush()
 
-    dataset = load_dataset(args.dataset_name)
-    if args.dataset_name == 'tiny_shakespeare':
-        return process_shakespear(dataset, 'train')
+        # train.bin is ~17GB, val.bin ~8.5MB
+        # train has ~9B tokens (9,035,582,198)
+        # val has ~4M tokens (4,434,897)
+
+        # to read the bin files later, e.g. with numpy:
+        # m = np.memmap('train.bin', dtype=np.uint16, mode='r')
+
+    # determine if .bin files already exist
+    cwd = os.getcwd()
+    model_dir = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+    dataset_dir = os.path.join(cwd, 'data', model_dir, args.dataset_name)
+
+    # download the data if you haven't already
+    if not os.path.exists(dataset_dir):
+        os.makedirs(os.path.join(cwd, 'data', model_dir, args.dataset_name))
+        dataset = load_dataset(args.dataset_name)
+        if args.dataset_name == 'tiny_shakespeare':
+            process_shakespear(dataset, 'train')
+        elif args.dataset_name == 'openwebtext':
+            process_webtext(dataset)
+
+    train_data = np.memmap(os.path.join(dataset_dir, 'train.bin'))
+    val_data = np.memmap(os.path.join(dataset_dir, 'validation.bin'))
+    vocab_size = tiktoken.get_encoding("gpt2").max_token_value
     
-    elif args.dataset_name == 'openwebtext':
-        return process_webtext(dataset)
+    return train_data, val_data, vocab_size
+
 
 def get_dataloader_iter(rng, dataset, args, train=True):
     """Get iteration of dataloader."""
@@ -180,7 +212,8 @@ def get_dataloader_iter(rng, dataset, args, train=True):
         args.total_update_steps if train else args.eval_iterations,
         args.batch_size * args.gradient_accumulation_steps if train else args.batch_size
     )
-    idxs = jax.random.randint(rng, shape=shape, minval=0, maxval=len(dataset)-block_size)
+    # idxs = jax.random.randint(rng, shape=shape, minval=0, maxval=len(dataset)-block_size, dtype=jnp.int64)
+    idxs = np.random.randint(low=0, high=len(dataset)-block_size, size=shape)
     batch_shape = (args.gradient_accumulation_steps, args.batch_size, block_size) if train else (args.batch_size, block_size)
     for idx in idxs:
         x = jnp.stack([dataset[i : i+block_size] for i in idx]).reshape(batch_shape)
@@ -188,23 +221,23 @@ def get_dataloader_iter(rng, dataset, args, train=True):
         yield Batch(input_tokens=x, target_tokens=y)
 
 def train_step(state, batch, rng):
+    # should pmean be taken inside the minibatch step or after all minibatches
     
     def loss_fn(params, mb, rng):
         logits = state.apply_fn(params, mb.input_tokens, rngs={"dropout": rng})
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, mb.target_tokens).mean()
         accuracy = (logits.argmax(-1) == mb.target_tokens).mean()
         return loss, accuracy
-    
+
     value_and_grad = jax.value_and_grad(loss_fn, has_aux=True)
 
     def minibatch_step(cumulative_state, minibatch):
         loss, accuracy, grads, rng = cumulative_state
         step_key, rng = jax.random.split(rng)
         (mini_loss, mini_accuracy), mini_grads = value_and_grad(state.params, minibatch, step_key)
-        # mini_grads = jax.lax.pmean(mini_grads, "batch")
         loss, accuracy, grads = jax.tree_map(jnp.add, (loss, accuracy, grads), (mini_loss, mini_accuracy, mini_grads))
         return (loss, accuracy, grads, rng), None
-    
+
     # accumulate gradients
     init_state = (0., 0., jax.tree_map(jnp.zeros_like, state.params), rng)
     (loss, accuracy, grads, rng), _ = jax.lax.scan(
@@ -250,6 +283,7 @@ def train(args: Args):
     args.global_learner_decices = [str(item) for item in global_learner_decices]
     args.learner_devices = [str(item) for item in learner_devices]
     args.batch_size = int(args.local_batch_size * len(local_devices) * args.world_size)
+    args.effective_batch_size = args.batch_size * args.gradient_accumulation_steps
     args.local_rank = jax.process_index()
 
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -275,10 +309,11 @@ def train(args: Args):
         )
         pprint(args)
 
+    np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng, train_iter_rng = jax.random.split(rng, 3)
 
-    train_data, val_data, vocab_size, vocab_encoder, vocab_decoder = load_hf_dataset(args)
+    train_data, val_data, vocab_size = load_hf_dataset(args)
     train_iter = get_dataloader_iter(train_iter_rng, train_data, args)
     args.gpt2_hparams.vocab_size = vocab_size
 
@@ -312,7 +347,7 @@ def train(args: Args):
     p_train_step = jax.pmap(train_step, axis_name='batch')
     p_val_step = jax.pmap(val_step, axis_name='batch')
     
-    print(f"Starting training on {len(train_data)} tokens, vocabulary size: {vocab_size}")
+    print(f"Starting training on {len(train_data)} tokens, vocabulary size: {vocab_size}, effective batch size: {args.effective_batch_size}")
     for global_step, train_batch in enumerate(train_iter):
         rng, step_rng = jax.random.split(rng)
         train_batch, step_rng = common_utils.shard([train_batch, step_rng])
@@ -336,11 +371,12 @@ def train(args: Args):
                 value = value.mean()
                 val_metrics[key] = value
                 writer.add_scalar(f"validation/{key}", value, global_step)
-            print(f"global_step: {global_step}  test/accuracy: {val_metrics['accuracy']:.3f}")
-        print(f"global_step: {global_step}  train/accuracy: {train_metrics['accuracy'].item():.3f}")
+            print(f"global_step: {global_step} test/accuracy: {val_metrics['accuracy']:.3f}")
+        if global_step % args.print_output_freq == 0:
+            print(f"global_step: {global_step} train/accuracy: {train_metrics['accuracy'].item():.3f}")
 
     state = jax_utils.unreplicate(state)
-    
+
     if args.save_path and args.local_rank == 0:
         ckpt = {"gpt_model": state, "args": vars(args)}
         orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -352,8 +388,12 @@ def train(args: Args):
 
 # TODO: create model presets for shakespear and webtext
 # TODO: setup webtext preprocessing (folloing garcia)
-# TODO: go and polishg model.py (understand to the point of conversational)
-# TODO: setup option to do periodic smapling along with evaluation
+# TODO: setup world class dataloader
+# TODO: read through tri dao implmentation, learn about optimizations, make them for yourself
+# TODO: go and polish model.py (understand to the point of conversational)
+# TODO: setup saving best only during training after a certain point
+# TODO: create presets for different gpt sizes
+# TODO: setup option to do periodic sampling along with evaluation
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
