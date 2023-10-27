@@ -1,10 +1,10 @@
-jax
 flax
 tyro
 optax
-numpy
-tiktoken
+# tiktoken
 wandb
 datasets
 torch
 tensorboard
+tensorflow
+tensorflow-datasets

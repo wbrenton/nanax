@@ -1,8 +1,7 @@
 #!/bin/bash
 
-# Check if the argument is passed and it's one of the accepted values
 if [ $# -eq 0 ]; then
-    echo "No arguments provided, please provide 'backend' argument"
+    echo "No arguments provided, please provide 'backend' argument in {'cpu', 'gpu' or 'tpu'}"
     exit 1
 elif [ "$1" != "cpu" -a "$1" != "gpu" -a "$1" != "tpu" ]; then
     echo "Invalid argument provided, please provide either 'cpu', 'gpu' or 'tpu'"
@@ -11,7 +10,7 @@ fi
 
 backend=$1
 
-python3 -m venv venv
+python3.9 -m venv venv
 source venv/bin/activate
 
 pip install --upgrade pip
