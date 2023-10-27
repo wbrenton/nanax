@@ -1,10 +1,6 @@
 # Nanax 
-> **Warning**: this project is a work in progress
+> 🚧: this project is a work in progress
 ### Nano + JAX
-
-```
-The main idea behind nanax is to create a CleanRL type of library for deep learning architectures and training pro
-```
 
 Minimal implementations of various deep learning architectures and training procedures in JAX. Heavily inspired by [CleanRL](https://github.com/vwxyzjn/cleanrl), offering simple and clean implementations with the goal of rapid prototyping for further research.
 
@@ -19,10 +15,10 @@ Minimal implementations of various deep learning architectures and training proc
 
 
 ## Quickstart
-Nanax comes with cpu.sh, gpu.sh, tpu.sh, so you can quickly get setup 
+Run setup.sh with backend argument to setup virtual environment with required dependencies. 
+
 ```
 git clone https://github.com/wbrenton/nanax.git
 cd nanax
-bash cpu.sh # {gpu.sh, tpu.sh}
-```
-
+bash setup.sh {cpu, gpu, tpu}
+``````

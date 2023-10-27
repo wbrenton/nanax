@@ -1,7 +1,7 @@
 flax
 tyro
 optax
-# tiktoken
+tiktoken
 wandb
 datasets
 torch

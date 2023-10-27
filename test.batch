@@ -1,0 +1,13 @@
+#!/bin/bash
+#SBATCH --job-name=cleanba
+#SBATCH --partition=g40x
+#SBATCH --job-name=carperai
+#SBATCH --account=carperai
+#SBATCH --gpus-per-task=1
+#SBATCH --cpus-per-gpu=16
+#SBATCH --ntasks=1 # 1 nodes
+#SBATCH --output=slurm/logs/%x_%j.out
+
+source venv/bin/activate
+
+srun python nanax/gpt/train.py
