@@ -33,7 +33,7 @@ class GPTHParams:
     n_embd: int = 384
     dropout: float = 0.2
     use_bias: bool = False
-    dtype: Optional[str] = jnp.float32
+    dtype = jnp.float32
 
 @dataclass
 class Args:
@@ -77,11 +77,9 @@ class Args:
     """number of update steps to decay for"""
     end_lr: float = 1e-4
     "the minimum learning rate"
-    world_size: tyro.conf.Suppress[int] = None
+    world_size: int = None
     """the number of processes to use"""
-    local_batch_size: tyro.conf.Suppress[int] = 64
-    """the per rank batch size"""
-    batch_size: tyro.conf.Suppress[int] = None
+    batch_size: int = 512
     """the batch size across all ranks"""
     total_update_steps: int = 5000
     """total number of optimization steps"""
@@ -98,11 +96,9 @@ class Args:
     local_rank: int = 0
     """the rank of this process"""
     learner_device_ids: List[int] = field(default_factory=lambda: [0])
-    "the device ids that script will use"
-    learner_devices: tyro.conf.Suppress[int] = None  # real type is `List[str]`
-    """the devices that script will use"""
-    global_learner_decices: tyro.conf.Suppress[int] = None  # real type is `List[str]`
-    """the total devices (across all nodes and machines) that script will use"""
+    """the devices ids to use per process"""
+    global_learner_devices: List[int] = field(default_factory=lambda: [0])
+    """the devices to use for across all processes"""
     gpt2_hparams: GPTHParams = field(default_factory=GPTHParams)
 
 def load_hf_dataset(args):
@@ -179,19 +175,17 @@ def get_dataloader_iter(rng, dataset, args, train=True):
 
 def train_step(state, batch, rng):
     input_tokens, target_tokens = batch
-    
+
     def loss_fn(params):
         logits = state.apply_fn(params, input_tokens, rngs={"dropout": rng})
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_tokens).mean()
         accuracy = (logits.argmax(-1) == target_tokens).mean()
         return loss, accuracy
-    
-    value_and_grad = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, accuracy), grads = value_and_grad(state.params)
+
+    (loss, accuracy), grads = jax.value_and_grad(
+        loss_fn, has_aux=True)(state.params)
     grads = jax.lax.pmean(grads, "batch")
     state = state.apply_gradients(grads=grads)
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    accuracy = jax.lax.pmean(accuracy, axis_name="batch")
     return state, {"loss": loss, "accuracy": accuracy}
 
 def val_step(state, batch):
@@ -204,8 +198,6 @@ def val_step(state, batch):
         return loss, accuracy
 
     loss, accuracy = loss_fn(state.params)
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    accuracy = jax.lax.pmean(accuracy, axis_name="batch")
     return {"loss": loss, "accuracy": accuracy}
 
 def train(args: Args):
@@ -215,36 +207,33 @@ def train(args: Args):
         )
 
     args.world_size = jax.process_count()
-    local_devices = jax.local_devices()
     global_devices = jax.devices()
+    local_devices = jax.local_devices()
     learner_devices = [local_devices[d_id] for d_id in args.learner_device_ids]
-    global_learner_decices = [
+    global_learner_devices = [
         global_devices[d_id + process_index * len(local_devices)]
         for process_index in range(args.world_size)
         for d_id in args.learner_device_ids
     ]
-    pprint({"global_learner_decices": global_learner_decices})
-    args.global_learner_decices = [str(item) for item in global_learner_decices]
-    args.learner_devices = [str(item) for item in learner_devices]
-    args.batch_size = int(args.local_batch_size * len(local_devices) * args.world_size)
+    pprint({"global_learner_devices": global_learner_devices})
+    args.global_learner_devices = [str(item) for item in global_learner_devices]
     args.local_rank = jax.process_index()
 
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace()  # dummy writer
     writer.add_scalar = lambda x, y, z: None
-    if args.local_rank == 0:
-        if args.track:
-            import wandb
+    if args.track and args.local_rank == 0:
+        import wandb
 
-            wandb.init(
-                project=args.wandb_project_name,
-                entity=args.wandb_entity,
-                sync_tensorboard=True,
-                config=asdict(args),
-                name=run_name,
-                save_code=True,
-            )
-            wandb.run.log_code(".")
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=asdict(args),
+            name=run_name,
+            save_code=True,
+        )
+        wandb.run.log_code(".")
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
@@ -252,13 +241,16 @@ def train(args: Args):
         )
         pprint(args)
 
+    # seeding
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng, train_iter_rng = jax.random.split(rng, 3)
 
+    # initialize dataset
     train_data, val_data, vocab_size, vocab_encoder, vocab_decoder = load_hf_dataset(args)
     train_iter = get_dataloader_iter(train_iter_rng, train_data, args)
     args.gpt2_hparams.vocab_size = vocab_size
 
+    # initialize model, optimizer, and train state
     gpt = GPT(args.gpt2_hparams)
     x = jnp.zeros((args.batch_size, args.gpt2_hparams.block_size), dtype=jnp.int32)
     params = gpt.init(init_rng, x, train=False)
@@ -285,29 +277,31 @@ def train(args: Args):
         params=params,
         tx=optimizer
     )
-    state = jax_utils.replicate(state)
-    p_train_step = jax.pmap(train_step, axis_name='batch')
-    p_val_step = jax.pmap(val_step, axis_name='batch')
     
+    # replicate across learner devices
+    state = jax_utils.replicate(state)
+    train_step = jax.pmap(train_step, axis_name='devices')
+    val_step = jax.pmap(val_step, axis_name='devices')
+
     print(f"Starting training on {len(train_data)} tokens, vocabulary size: {vocab_size}")
     for global_step, train_batch in enumerate(train_iter):
         rng, step_rng = jax.random.split(rng)
-        train_batch, step_rng = common_utils.shard([train_batch, step_rng])
-        state, train_metrics = p_train_step(state, train_batch, step_rng)
+        train_batch, step_rng = common_utils.shard([train_batch, step_rng], )
+        state, train_metrics = train_step(state, train_batch, step_rng)
         
         writer.add_scalar("train/lr", lr_schedule(global_step).item())
         train_metrics = common_utils.get_metrics([train_metrics])
         for key, value in train_metrics.items():
             writer.add_scalar(f"train/{key}", value, global_step)
-        
+
         if global_step % args.eval_frequency == 0:
             val_iter = get_dataloader_iter(step_rng[0], val_data, args, train=False)
             val_metrics_list = []
             for val_batch in val_iter:
                 val_batch = common_utils.shard(val_batch)
-                val_metrics = p_val_step(state, val_batch)
+                val_metrics = val_step(state, val_batch)
                 val_metrics_list.append(val_metrics)
-            
+
             val_metrics = common_utils.get_metrics(val_metrics_list)
             for key, value in val_metrics.items():
                 value = value.mean()
@@ -316,7 +310,7 @@ def train(args: Args):
             print(f"global_step: {global_step}  test/accuracy: {val_metrics['accuracy']:.3f}")
 
     state = jax_utils.unreplicate(state)
-    
+
     if args.save_path and args.local_rank == 0:
         ckpt = {"gpt_model": state, "args": vars(args)}
         orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -327,9 +321,8 @@ def train(args: Args):
         wandb.finish()
 
 # TODO: create model presets for shakespear and webtext
-# TODO: setup webtext preprocessing (folloing garcia)
-# TODO: go and polishg model.py (understand to the point of conversational)
-# TODO: setup option to do periodic smapling along with evaluation
+# TODO: go and polish model.py (understand to the point of conversational)
+# TODO: setup option to do periodic sampling along with evaluation
 
 if __name__ == "__main__":
     args = tyro.cli(Args)

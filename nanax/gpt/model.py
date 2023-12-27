@@ -22,9 +22,9 @@ class CausalSelfAttention(nn.Module):
         c_attn = nn.Dense(3 * C, use_bias=self.use_bias, dtype=self.dtype)(x) # (B, T, 3*C)
         q, k, v = jnp.split(c_attn, 3, axis=-1) # (B, T, C)
         q, k, v = map(lambda arr: arr.reshape(B, T, self.n_head, head_dim).swapaxes(1, 2), [q, k, v]) # (B, nh, T, hd)
-        
+
         causal_mask = jnp.tril(jnp.ones((T, T))).reshape(1, 1, T, T)
-        
+
         attn = q @ k.swapaxes(-2, -1) / jnp.sqrt(k.shape[-1]) # (B, nh, T, hd) @ (B, nh, hd, T) -> (B, nh, T, T)
         attn = jnp.where(causal_mask[:, :, :T, :T], attn, -jnp.inf)
         attn = jax.nn.softmax(attn, axis=-1)
@@ -91,7 +91,7 @@ class GPT(nn.Module):
         x = self.ln_f(x) 
         logits = self.wte.attend(x) # (b, t, n_embed) @ (1, vocab_size, n_embd).T -> (b, t, vocab_size)
         return logits
-    
+
     def generate(self, key, params, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete

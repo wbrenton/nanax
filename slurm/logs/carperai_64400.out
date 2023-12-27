@@ -1,0 +1,5 @@
+[I 2023-12-19 20:38:08,143] A new study created in memory with name: no-name-9d068195-3cec-4ba9-b06b-e69af59419f7
+2023-12-19 20:38:12.326955: W external/xla/xla/service/gpu/nvptx_compiler.cc:698] The NVIDIA driver's CUDA version is 12.0 which is older than the ptxas CUDA version (12.3.103). Because the driver is older than the ptxas version, XLA is disabling parallel compilation, which may slow down compilation. You should update your NVIDIA driver or use the NVIDIA-provided CUDA forward compatibility packages.
+slurmstepd: error: *** STEP 64400.0 ON ip-26-0-144-205 CANCELLED AT 2023-12-19T20:38:55 ***
+slurmstepd: error: *** JOB 64400 ON ip-26-0-144-205 CANCELLED AT 2023-12-19T20:38:55 ***
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
